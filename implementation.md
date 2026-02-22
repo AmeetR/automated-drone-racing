@@ -16,6 +16,7 @@ This document is the software engineering counterpart to `writeup.md`. It specif
 8. [Configuration Schema](#8-configuration-schema)
 9. [Sprint-Based Build Order](#9-sprint-based-build-order)
 10. [Dependencies](#10-dependencies)
+11. [Deployment Environments](#11-deployment-environments)
 
 ---
 
@@ -112,10 +113,13 @@ automated-drone-racing/
 │   │   ├── distillation.yaml
 │   │   ├── moe.yaml
 │   │   └── residual_rl.yaml
-│   └── eval/
-│       ├── default.yaml
-│       ├── ablation.yaml
-│       └── stress.yaml
+│   ├── eval/
+│   │   ├── default.yaml
+│   │   ├── ablation.yaml
+│   │   └── stress.yaml
+│   └── deploy/
+│       ├── local.yaml
+│       └── azure.yaml
 │
 ├── src/
 │   └── drone_racing/
@@ -192,7 +196,8 @@ automated-drone-racing/
 │   ├── train.py                       # Training entry point
 │   ├── eval.py                        # Evaluation entry point
 │   ├── compare.py                     # Algorithm comparison
-│   └── collect_data.py                # Teacher data collection
+│   ├── collect_data.py                # Teacher data collection
+│   └── setup_azure.ps1               # Azure VM provisioning script
 │
 ├── tests/                             # Unit and integration tests
 │   ├── test_types.py
@@ -601,6 +606,8 @@ class DCLSimAdapter(SimulatorInterface):
 ```
 
 The adapter handles all DCL-specific concerns (connection management, serialization, timing) and exposes the clean `SimulatorInterface` to the rest of the stack.
+
+**Platform note:** The DCL simulator runs as a **Windows application**. The adapter must work on both local Windows machines and Azure Windows VMs (see Section 11 for deployment environments).
 
 #### GymnasiumWrapper (`sim/gymnasium.py`)
 
@@ -1935,3 +1942,133 @@ Do **not** pin exact versions in `pyproject.toml`. Use minimum version constrain
 | `wandb` | Experiment tracking | Real-time dashboards, comparison tables, hyperparameter sweeps |
 | `opencv-python` | Classical perception | HSV, contours, PnP, morphological ops |
 | `gymnasium` | RL environment interface | Industry standard, SB3 compatibility |
+
+---
+
+## 11. Deployment Environments
+
+The DCL simulator runs as a **Windows application**, so both development and competition submission require a Windows execution environment. We support two deployment targets: a local Windows machine and an Azure Windows VM for cloud-based runs.
+
+### 11.1 Local Windows Machine
+
+The simplest path. Requirements:
+
+- **OS:** Windows 10/11 (64-bit)
+- **GPU:** Dedicated NVIDIA GPU (for MPPI rollouts and optional CNN inference)
+- **Python:** 3.10+ via Anaconda, Miniconda, or official installer
+- **DCL Simulator:** Downloaded from the competition platform (Windows executable)
+
+**Setup:**
+
+```powershell
+# Create environment
+conda create -n drone-racing python=3.10 -y
+conda activate drone-racing
+
+# Install PyTorch with CUDA
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# Install project
+pip install -e ".[dev]"
+
+# Launch DCL simulator (separate process)
+& "C:\DCL\simulator.exe" --headless
+
+# Run autonomy stack against DCL
+python scripts/run.py sim=dcl
+```
+
+### 11.2 Azure Windows VM
+
+For cloud-based development, parallel experiments, or when a local GPU is unavailable. Azure provides GPU-accelerated Windows VMs suitable for running both the DCL simulator and the autonomy stack simultaneously.
+
+**Recommended VM families** (from [Azure VM sizes overview](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/overview)):
+
+| VM Series | GPU | vCPUs | RAM | Use Case | Est. Cost |
+|-----------|-----|-------|-----|----------|-----------|
+| **NCasT4\_v3** | 1x NVIDIA T4 (16 GB) | 4--48 | 28--440 GB | Development + eval runs | ~$0.50--3.60/hr |
+| **NCads\_H100\_v5** | 1x NVIDIA H100 | 40--80 | 320--640 GB | Heavy MPPI tuning, large-scale data collection | ~$6--12/hr |
+| **NV-series v4** | AMD Radeon Instinct | 8--32 | 28--112 GB | Budget option (AMD GPU; PyTorch ROCm) | ~$0.80--3.20/hr |
+
+For most development work, an **NCasT4\_v3 with 1x T4 GPU** (Standard\_NC4as\_T4\_v3 or Standard\_NC8as\_T4\_v3) provides the best cost-performance tradeoff: the T4 is sufficient for MPPI rollouts with K=512 samples and TensorRT inference, and the VM can run the DCL simulator concurrently.
+
+**Provisioning (Azure CLI):**
+
+```bash
+# Create resource group
+az group create --name drone-racing-rg --location westus2
+
+# Create VM with T4 GPU, Windows 11, 8 vCPUs, 56 GB RAM
+az vm create \
+    --resource-group drone-racing-rg \
+    --name drone-racing-dev \
+    --image MicrosoftWindowsDesktop:windows-11:win11-24h2-pro:latest \
+    --size Standard_NC8as_T4_v3 \
+    --admin-username droneracer \
+    --admin-password '<password>' \
+    --public-ip-sku Standard
+
+# Open RDP port
+az vm open-port --resource-group drone-racing-rg --name drone-racing-dev --port 3389
+
+# Connect via RDP
+mstsc /v:<public-ip>
+```
+
+**Post-provisioning setup on the Azure VM:**
+
+1. Install NVIDIA GPU drivers (Azure provides an extension: `NvidiaGpuDriverWindows`)
+2. Install Python 3.10+ (Miniconda recommended)
+3. Install CUDA Toolkit 12.1+
+4. Clone the repo and `pip install -e ".[dev]"`
+5. Download and install the DCL simulator
+6. Run: `python scripts/run.py sim=dcl`
+
+**Automation with startup scripts:**
+
+For repeatable experiments, use Azure VM custom script extensions or a `setup_azure.ps1` PowerShell script that automates driver installation, environment setup, and repo cloning. This enables spinning up fresh VMs for parallel experiment sweeps.
+
+### 11.3 Deployment Configuration (`configs/deploy/`)
+
+Add deploy configs to Hydra:
+
+**`configs/deploy/local.yaml`:**
+
+```yaml
+platform: windows_local
+dcl_exe_path: "C:\\DCL\\simulator.exe"
+headless: false
+gpu_device: 0
+```
+
+**`configs/deploy/azure.yaml`:**
+
+```yaml
+platform: azure_vm
+dcl_exe_path: "C:\\DCL\\simulator.exe"
+headless: true
+gpu_device: 0
+wandb_mode: online          # always log to cloud from Azure
+auto_shutdown_hours: 4      # cost safety: auto-stop after 4 hours
+```
+
+**Usage:**
+
+```bash
+# Local development
+python scripts/run.py sim=dcl deploy=local
+
+# Azure cloud run (headless, auto-shutdown)
+python scripts/run.py sim=dcl deploy=azure
+
+# Azure batch comparison (multirun on cloud)
+python scripts/compare.py planner=mppi,pid,student,moe deploy=azure --multirun
+```
+
+### 11.4 Cross-Platform Compatibility Notes
+
+- **Path handling:** Use `pathlib.Path` throughout the codebase. Never hard-code `/` or `\\` separators.
+- **Process management:** The DCL adapter launches the simulator as a subprocess. Use `subprocess.Popen` with platform-aware arguments (no `shell=True` on Windows).
+- **GPU detection:** PyTorch's `torch.cuda.is_available()` works identically on local and Azure Windows. The Hydra config `device` field (`cuda` or `cpu`) is the single control point.
+- **wandb offline mode:** When running without internet (e.g., air-gapped competition venue), set `WANDB_MODE=offline` and sync logs afterward with `wandb sync`.
+- **Linux development:** For training pipelines (distillation, RL) that do not require the DCL simulator, developers can work on Linux/macOS using `DummySim`. Only sim integration and final submission require Windows.
