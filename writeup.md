@@ -40,7 +40,7 @@ The AI Grand Prix, operated by the Drone Champions League (DCL) in partnership w
 | Physical Qualifier | September 2026 | In-person training and qualification on standardized hardware (California) |
 | Finals | November 2026 | Championship event (Ohio) |
 
-In physical stages, all teams fly identical drones built by Neros Technologies with no hardware modifications permitted. Technical specifications for the standardized UAS---including onboard compute, camera model, and IMU grade---have not yet been released. This uncertainty motivates a **portability-first** design: our autonomy stack must run within Jetson Nano/Orin Nano--class constraints from day one, even if the virtual phase runs on desktop hardware.
+In physical stages, all teams fly identical drones built by Neros Technologies with no hardware modifications permitted; code quality is the sole differentiator. The platform integrates DCL's "AI vector module," but technical specifications for the standardized UAS---including onboard compute, camera model, and IMU grade---have not yet been released. This uncertainty motivates a **portability-first** design: our autonomy stack targets Jetson-class embedded constraints as a conservative design envelope, even though the virtual phase runs on desktop hardware (described as requiring "a mid-tier PC with a dedicated GPU"). Final hardware targets will be revised when specifications are published.
 
 ### 1.3 Environment & Constraints
 
@@ -65,6 +65,20 @@ Performance is evaluated along three axes, in decreasing priority:
 ### 1.5 Why This Problem Is Hard
 
 The fundamental difficulty arises from the **tight coupling** of five subsystems---perception, state estimation, planning, control, and safety management---all operating under aggressive dynamics with hard actuation limits. A solution that excels at planning but ignores actuator saturation will crash. A solution that prioritizes safety will be too slow. The winning system must navigate this tradeoff explicitly and optimally.
+
+### 1.6 Known Unknowns
+
+Several platform details remain unspecified and must be treated as open design variables until the competitor SDK and API are released. Our architecture is designed to accommodate any resolution of these unknowns without structural rework.
+
+| Unknown | Design Impact | Our Assumption (Provisional) |
+|---------|---------------|------------------------------|
+| **Observation modalities** | Whether we receive vectorized state, raw images, or both; whether privileged sim state is available | Design for both: pass-through adapter if privileged state is given; full perception pipeline if not |
+| **Action interface** | Whether the platform exposes rotor thrusts, (collective thrust, body rates), or (desired accel, yaw rate) | Support all three via a low-level adapter below the planner/policy |
+| **Timing model** | Control frequency, observation latency, whether actions are held between steps | Architect for 50 Hz control with explicit latency compensation; adjustable on API release |
+| **Reset and episode semantics** | Whether episodes reset on crash, whether partial runs score, penalty structure for gate misses | Implement flexible gate-ordering and validity logic; finalize when rules are confirmed |
+| **Gate geometry specification** | Exact gate dimensions, visual appearance in sim, whether geometry is provided programmatically | Use PnP with configurable gate model; fallback to learned detection if appearance varies |
+| **Onboard compute (physical stage)** | Processor, GPU, memory, power budget | Target Jetson-class constraints (expected range: 7--30 W); revise when specs are published |
+| **Evaluation determinism** | Whether runs are deterministic or stochastic; whether leaderboard reflects best-of-N or single run | Optimize for robustness (low variance) alongside speed |
 
 ---
 
@@ -141,13 +155,15 @@ Robustness in fast drone racing is not a single technique but an engineering pos
 
 ### 2.5 Embedded Execution Constraints
 
-Because the AI Grand Prix drone specifications are not yet public, it is prudent to anchor compute budgets on the widely used embedded platforms in the racing literature:
+Because the AI Grand Prix drone specifications are not yet public, we anchor compute budgets on the widely used embedded platforms in the racing literature as **conservative design targets** (not confirmed hardware):
 
-| Platform | Power Envelope | Compute | Used By |
-|----------|---------------|---------|---------|
-| Jetson TX2 | 7.5--15 W | 256 CUDA cores | Swift [12] |
-| Jetson Xavier | 10--30 W | 512 CUDA cores, 2x DLA | AlphaPilot [1] |
-| Jetson Orin Nano | 7--25 W | Up to 67 INT8 TOPS | MPPI feasibility studies [23] |
+| Platform | Power Envelope | Compute | Used By | Status |
+|----------|---------------|---------|---------|--------|
+| Jetson TX2 | 7.5--15 W | 256 CUDA cores | Swift [12] | Reference |
+| Jetson Xavier | 10--30 W | 512 CUDA cores, 2x DLA | AlphaPilot [1] | Reference |
+| Jetson Orin Nano | 7--25 W | Up to 67 INT8 TOPS | MPPI feasibility studies [23] | Reference |
+
+*Note: actual competition hardware may differ. These platforms define a plausible envelope; designs will be revised when specifications are published.*
 
 The two most important software acceleration tools are **TensorRT** (used by both AlphaPilot and Swift for FP16/INT8 inference optimization) and **JIT compilation** (JAX XLA or Numba) for numerical kernels such as MPPI rollouts and CEM sampling. A practical rule consistent with the literature: run perception networks through TensorRT at FP16 minimum, keep the control inner loop deterministic and small, and push heavy sampling and rollout computation into compiled kernels [11, 13, 23].
 
@@ -167,7 +183,7 @@ The system must detect gates from onboard camera imagery and estimate their 6-Do
 
 ### 3.2 State Estimation
 
-Accurate knowledge of the drone's full kinematic state---position, velocity, orientation, and angular rates---is a prerequisite for effective planning and control. The state estimator must fuse heterogeneous sensor modalities (IMU, simulator-provided state, vision-derived landmarks) and maintain accuracy under aggressive dynamics where linearization assumptions may break down.
+Accurate knowledge of the drone's full kinematic state---position, velocity, orientation, and angular rates---is a prerequisite for effective planning and control. In the virtual qualifier, the simulator may provide privileged state information (exact position, velocity, attitude); if so, the state estimator reduces to a pass-through adapter. In physical stages, however, the estimator must fuse heterogeneous sensor modalities (IMU, VIO, vision-derived gate landmarks) and maintain accuracy under aggressive dynamics where linearization assumptions may break down. We architect the estimator boundary as a swappable module: trivial in sim if privileged state is available, but ready to accept VIO and gate-corrected updates when required.
 
 ### 3.3 Planning Under Dynamics
 
@@ -237,7 +253,7 @@ The full state vector $\mathbf{x} \in \mathbb{R}^n$ is defined as:
 | Relative gate pose | $\mathbf{g}\_{\text{rel}}$ | $\mathbb{R}^6$ | Position and orientation of the next gate in body frame |
 | Progress scalar | $s$ | $\mathbb{R}$ | Normalized progress along the course $[0, 1]$ |
 
-The control input $\mathbf{u} \in \mathbb{R}^4$ represents collective thrust and body-frame torques (or equivalently, four individual rotor thrusts).
+The control input depends on the platform's action interface, which has not yet been specified. Common modalities include individual rotor thrusts ($\mathbf{u} \in \mathbb{R}^4$), collective thrust with body rates ($T, \omega\_x, \omega\_y, \omega\_z$), or desired acceleration with yaw rate ($\mathbf{a}, \dot{\psi}$). We place a **low-level adapter** below the planner that maps our internal representation (desired acceleration and yaw rate) to whatever command modality the platform exposes. This adapter is the only component that must change when the action interface is finalized.
 
 ### 4.4 MPPI Planner
 
@@ -425,6 +441,26 @@ $$
 
 where $[\cdot]\_+ = \max(0, \cdot)$ denotes the positive part. The weights $(w\_p, w\_g, w\_c, w\_s, w\_j, w\_t)$ are the primary tuning knobs that encode the speed--safety tradeoff.
 
+#### 4.5.9 Gate Passage Terminal Bonus
+
+The seven running-cost terms above can cause the planner to "dither" near a gate plane---repeatedly approaching but never committing to traversal. To eliminate this, we add a **terminal progress event**: when a rollout trajectory crosses the gate plane within the gate aperture, a large negative cost (reward) is applied, and the target gate index advances for the remainder of that rollout.
+
+$$
+\mathcal{L}\_{\text{pass}}(\tau) = -w\_{\text{pass}} \cdot \mathbb{1}[\text{trajectory crosses gate plane within aperture}]
+$$
+
+This ensures the planner is incentivized to commit to gate traversal rather than hover at the threshold, and naturally handles multi-gate lookahead when the planning horizon spans more than one gate.
+
+#### 4.5.10 Perception-Aware Cost Term (Optional)
+
+Top racing systems implicitly manage gate visibility: aggressive maneuvers can rotate the camera away from the next gate, blinding the detector and causing downstream estimation failures. We include an optional perception-aware penalty that discourages maneuvers which would push the predicted gate projection to the image boundary or reduce it below a minimum apparent size:
+
+$$
+\mathcal{L}\_{\text{vis}}(\mathbf{x}\_t) = w\_{\text{vis}} \left[ \max\!\left(0,\; \theta\_{\text{gate}}(\mathbf{x}\_t) - \theta\_{\max}\right)^2 + \max\!\left(0,\; d\_{\text{gate}}(\mathbf{x}\_t) - d\_{\max}\right)^2 \right]
+$$
+
+where $\theta\_{\text{gate}}$ is the angular offset of the gate from the camera's optical axis and $d\_{\text{gate}}$ is the distance to the gate. This term is disabled by default and activated only if perception dropout analysis (Section 7) reveals visibility-related failures. The approach is consistent with perception-aware planning demonstrated in recent A2RL x DCL competition systems [15].
+
 ---
 
 ## 5. Proposed Improvements
@@ -465,6 +501,12 @@ $$
 $$
 
 The auxiliary loss terms ensure the student inherits the constraint-awareness of the teacher's cost function, not just its input--output mapping.
+
+An optional **value head** can be added to the student network, trained to predict the teacher's cost-to-go $V^{\*}(s\_t)$. This stabilizes learning when the teacher's action mapping is multimodal (e.g., choosing between going above or below a gate), because the value signal disambiguates which action trajectory is preferred.
+
+#### Distribution Shift Mitigation (DAgger)
+
+Pure behavior cloning fails when the student visits states the teacher never produced, because small deviations compound rapidly in racing dynamics. We mitigate this via DAgger [30]: iteratively execute the learned policy in simulation, collect the resulting states, relabel them with the teacher's actions, and aggregate into the training set. This is particularly important when pushing near the performance envelope, where even minor drift from the teacher's state distribution can cause gate misses or instability.
 
 ### 5.2 Mixture-of-Experts (MoE)
 
@@ -516,6 +558,20 @@ $$
 
 where $k^{\*}$ is the ground-truth expert label and $g(\mathbf{x})$ is the gating network's output distribution. The switching penalty discourages rapid oscillation between experts (jitter).
 
+#### Practical Considerations
+
+Two implementation details are critical for MoE to work reliably in practice:
+
+1. **Soft routing during training, hard routing at inference.** During training, the gating network outputs a soft mixture (weighted sum over all experts), which provides gradients to all expert heads and prevents premature specialization. At inference time, we switch to hard routing (argmax) so that only a single expert executes per timestep, keeping deployment latency identical to a single-expert MLP.
+
+2. **Load-balancing regularization.** Without explicit encouragement, the gating network can collapse to routing all states to a single dominant expert, wasting the capacity of the others. We add a load-balancing loss inspired by the Switch Transformer [29]:
+
+$$
+\mathcal{L}\_{\text{balance}} = K \cdot \sum\_{k=1}^{K} f\_k \cdot p\_k
+$$
+
+where $f\_k$ is the fraction of training examples routed to expert $k$ and $p\_k$ is the average gating probability assigned to expert $k$. This term encourages uniform expert utilization. Combined with the teacher-derived regime labels for supervised routing, this prevents both collapse and unnecessary fragmentation.
+
 ### 5.3 Residual Reinforcement Learning
 
 #### Motivation
@@ -560,6 +616,10 @@ To ensure the learned components generalize across the range of conditions encou
 | IMU noise | $\sigma \in [0, 0.05]$ rad/s | Sensor degradation |
 | Drag coefficient | 0.8--1.2x | Aerodynamic uncertainty |
 | Gate position jitter | $\pm 5$ cm | Localization error |
+| **Control latency / jitter** | **0--50 ms delay, uniform** | **Action-hold and timing uncertainty** |
+| **Observation latency** | **0--30 ms** | **Sensor pipeline delay** |
+
+The addition of **latency and action-hold randomization** deserves emphasis: control delay is a silent killer in racing systems, and is often the single most decisive sim-to-real gap. Racing controllers tuned in zero-latency simulation frequently oscillate or crash when even 10--20 ms of delay is introduced. By randomizing both the delay magnitude and its jitter (non-constant delay), we train policies that are inherently robust to timing uncertainty.
 
 Training explicitly includes states near the actuation boundary to ensure the policy learns graceful degradation rather than catastrophic failure when approaching physical limits.
 
@@ -610,6 +670,20 @@ We compare against two reference implementations:
 1. **PID waypoint follower.** A simple controller that tracks a sequence of waypoints at gate centers using cascaded PID loops (position -> velocity -> attitude -> rate). This represents the minimal viable solution.
 2. **End-to-end RL.** A PPO agent trained from state observations (no vision) with a dense reward function. This represents the pure learning baseline, highlighting the advantages of our hybrid approach.
 
+### 6.5 Failure Taxonomy
+
+A systematic understanding of how the system can fail is as important as optimizing its nominal performance. We identify five primary failure modes, their root causes, and the architectural defenses designed to mitigate each:
+
+| Failure Mode | Root Cause | Observable Symptom | Defense |
+|---|---|---|---|
+| **Missed gate association** | Perception detects wrong gate or fails to associate corners correctly in multi-gate views | Drone flies toward wrong gate; gate-pass event not triggered | PAF-style corner association (fallback); gate-ordering logic with geometric consistency check |
+| **Late braking / overshoot** | Planner horizon too short or progress cost too aggressive relative to alignment cost | Drone clips gate frame or passes through at excessive lateral offset | Increase gate alignment weight near gate plane; extend planning horizon; gate-passage terminal bonus (Section 4.5.9) |
+| **Saturation-induced oscillation** | Controller requests thrust/torque beyond actuator limits for sustained periods | Oscillatory flight, altitude loss, or spiral divergence near gates | Saturation cost term (Section 4.5.4); feasibility filter; low-authority MoE expert (Section 5.2) |
+| **Perception dropout** | Motion blur, gate out of field-of-view, or occlusion causes detector to return no detection | State estimator relies on stale gate pose; planner drifts off course | Temporal filtering with confidence decay; perception-aware cost (Section 4.5.10); recovery MoE expert |
+| **Estimator divergence** | VIO drift exceeds gate-correction rate; IMU bias spike; filter divergence under aggressive maneuvers | Increasing position error; drone misses gate aperture despite correct planning | Gate-landmark EKF corrections; divergence detection and filter reset; conservative fallback mode |
+
+Each failure mode maps to specific stress tests (Section 6.3) and can be probed systematically using Adaptive Stress Testing [28], where an adversarial agent searches for disturbance sequences that trigger each failure class. The failure taxonomy also informs the MoE expert design (Section 5.2): the recovery and conservative experts are specifically designed to handle perception dropout and estimator divergence gracefully.
+
 ---
 
 ## 7. Development Strategy & Phased Roadmap
@@ -648,6 +722,21 @@ flowchart TD
 | Cost function tuning | Calibrated weights | Sub-crash lap completion on 3 tracks |
 | Integration testing | Full pipeline end-to-end | 10 consecutive clean laps |
 | Robustness testing | Stress test report | < 5% crash rate under moderate perturbation |
+
+#### Round-1 MVP (Minimum Viable Submission)
+
+The following is a brutally concrete specification of what must work for a qualifying submission. Items marked "stub" can be replaced with minimal implementations until the platform API is finalized.
+
+| Component | Target Rate | Runs On | MVP Behavior |
+|-----------|------------|---------|--------------|
+| **Gate detector** | 30 Hz | GPU | HSV + contour + PnP; CNN fallback available but not required |
+| **State estimator** | 50--100 Hz | CPU | Pass-through of sim state if available; EKF stub if not |
+| **MPPI planner** | 50 Hz | GPU | `pytorch-mppi` with 512 samples, H=30 horizon |
+| **Low-level adapter** | 50 Hz | CPU | Maps desired accel/yaw-rate to platform action space (stubbed to match API on release) |
+| **Feasibility filter** | 50 Hz | CPU | Clamp commands to actuator limits; reject excessive tilt |
+| **Gate ordering logic** | Event-driven | CPU | Track next-gate index; advance on plane crossing; handle missed gates |
+
+**What can be stubbed until API release:** state estimator internals, exact action-space mapping, reset/episode handling, gate geometry loader. **What cannot be stubbed:** the MPPI loop, cost function, and gate detection---these require iterative tuning against the simulator and define competition performance.
 
 ### Phase 2: Optimization
 
@@ -704,9 +793,9 @@ This architecture reflects the state of the art in autonomous racing: not massiv
 
 [13] Kaufmann, E., et al. (2023). Champion-level drone racing using deep reinforcement learning -- supplementary materials. *Nature*, 620.
 
-[14] Bosello, M., et al. (2026). MonoRace: Monocular autonomous drone racing with robust perception and agile control. *arXiv preprint*.
+[14] Bosello, M., et al. (2026). MonoRace: Monocular autonomous drone racing with robust perception and agile control. *arXiv preprint*. *(Citation to be verified; referenced in secondary literature but full preprint not independently confirmed at time of writing.)*
 
-[15] Trumpp, R., et al. (2025). Perception-aware model predictive control for autonomous drone racing. *A2RL x DCL Competition Report*.
+[15] Trumpp, R., et al. (2025). Perception-aware model predictive control for autonomous drone racing. *A2RL x DCL Competition Report*. *(Competition report; not a peer-reviewed publication. Details sourced from secondary literature.)*
 
 [16] De Wagter, C., et al. (2018). Autonomous flight of a 20-gram flapping wing MAV with a 4-gram onboard stereo vision system. *Proceedings of the IEEE International Conference on Robotics and Automation (ICRA)*.
 
@@ -733,3 +822,7 @@ This architecture reflects the state of the art in autonomous racing: not massiv
 [27] Mayne, D. Q. (2005). Robust model predictive control of constrained linear systems with bounded disturbances. *Automatica*, 41(2), 219--224.
 
 [28] Koren, M., Alsaif, S., Lee, R., & Kochenderfer, M. J. (2018). Adaptive stress testing for autonomous vehicles. *Proceedings of the IEEE Intelligent Vehicles Symposium (IV)*, 1--7.
+
+[29] Fedus, W., Zoph, B., & Shazeer, N. (2022). Switch Transformers: Scaling to trillion parameter models with simple and efficient sparsity. *Journal of Machine Learning Research*, 23(120), 1--39.
+
+[30] Ross, S., Gordon, G., & Bagnell, D. (2011). A reduction of imitation learning and structured prediction to no-regret online learning. *Proceedings of the International Conference on Artificial Intelligence and Statistics (AISTATS)*, 627--635.
