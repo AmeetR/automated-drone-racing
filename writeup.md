@@ -13,7 +13,7 @@ Autonomous drone racing demands the tight integration of perception, state estim
 ## Table of Contents
 
 1. [Introduction & Problem Statement](#1-introduction--problem-statement)
-2. [Background & Related Work](#2-background--related-work)
+2. [Related Work](#2-related-work)
 3. [Core Technical Challenges](#3-core-technical-challenges)
 4. [Baseline Architecture](#4-baseline-architecture)
 5. [Proposed Improvements](#5-proposed-improvements)
@@ -30,16 +30,29 @@ Autonomous drone racing demands the tight integration of perception, state estim
 
 We address the problem of developing a **fully autonomous drone control system** capable of navigating a structured three-dimensional racecourse. The course consists of a sequence of standardized gates that must be traversed in a prescribed order. The drone receives onboard sensor data---including camera imagery and inertial measurements---and must produce low-level control commands without any human intervention.
 
-### 1.2 Environment & Constraints
+### 1.2 Competition Structure
+
+The AI Grand Prix, operated by the Drone Champions League (DCL) in partnership with Anduril Industries, follows a phased format:
+
+| Phase | Timeline | Format |
+|-------|----------|--------|
+| Virtual Qualifiers | April--June 2026 | Teams submit Python-based AI algorithms into a DCL-built simulation platform |
+| Physical Qualifier | September 2026 | In-person training and qualification on standardized hardware (California) |
+| Finals | November 2026 | Championship event (Ohio) |
+
+In physical stages, all teams fly identical drones built by Neros Technologies with no hardware modifications permitted. Technical specifications for the standardized UAS---including onboard compute, camera model, and IMU grade---have not yet been released. This uncertainty motivates a **portability-first** design: our autonomy stack must run within Jetson Nano/Orin Nano--class constraints from day one, even if the virtual phase runs on desktop hardware.
+
+### 1.3 Environment & Constraints
 
 The competition environment imposes several critical constraints:
 
-- **Simulation platform.** All runs execute inside the DCL (Drone Champions League) simulation engine on a Windows-based host. The autonomy stack interfaces with the simulator via a Python API.
+- **Simulation platform.** Virtual qualifiers execute inside the DCL simulation engine. The autonomy stack interfaces with the simulator via a Python API, receiving visual and sensor data under realistic physics.
 - **Standardized gates.** Gates have known geometry and visual appearance, simplifying perception but demanding precise localization for safe traversal at high speed.
 - **Realistic flight dynamics.** The simulator models aerodynamic effects, actuator latency, thrust limits, and rotational inertia. Control solutions must respect these physical realities.
 - **Python-based stack.** All autonomy logic---perception, planning, control---must be implemented in Python (with permissible compiled extensions for performance-critical components).
+- **Unknown final hardware.** The exact I/O API (observation structure, action interface, timing model) for the virtual platform, and the onboard compute and sensor suite for physical stages, remain unspecified. The stack must handle both vectorized-state-plus-image and image-plus-IMU observation modalities.
 
-### 1.3 Evaluation Criteria
+### 1.4 Evaluation Criteria
 
 Performance is evaluated along three axes, in decreasing priority:
 
@@ -49,37 +62,98 @@ Performance is evaluated along three axes, in decreasing priority:
 | Secondary | **Validity** | Correct gate traversal sequence, no crashes, stable flight |
 | Tertiary | **Robustness** | Consistent performance across runs under minor perturbation |
 
-### 1.4 Why This Problem Is Hard
+### 1.5 Why This Problem Is Hard
 
 The fundamental difficulty arises from the **tight coupling** of five subsystems---perception, state estimation, planning, control, and safety management---all operating under aggressive dynamics with hard actuation limits. A solution that excels at planning but ignores actuator saturation will crash. A solution that prioritizes safety will be too slow. The winning system must navigate this tradeoff explicitly and optimally.
 
 ---
 
-## 2. Background & Related Work
+## 2. Related Work
 
-### 2.1 Autonomous Drone Racing in the Literature
+Autonomous drone racing has matured rapidly over the past several years, producing a set of competition-proven systems and algorithm families that directly inform our design. We organize the related work into five areas: landmark racing systems, perception and state estimation, planning and control algorithms, robustness and sim-to-real transfer, and embedded execution constraints.
 
-Autonomous drone racing has emerged as a benchmark problem at the intersection of robotics, computer vision, and optimal control. Several landmark efforts inform our approach:
+### 2.1 Landmark Racing Systems
 
-- **DARPA AlphaPilot (2019--2021).** The first large-scale autonomous drone racing competition. Winning teams employed classical perception pipelines with model predictive control, validating the viability of modular architectures over end-to-end learning [1].
-- **ETH Zurich Aggressive Quadrotor Research.** Extensive work on agile flight, time-optimal trajectory generation, and perception-aware planning. Notably, Kaufmann et al. demonstrated deep learning for drone racing with sim-to-real transfer [2].
-- **UPenn GRASP Lab.** Pioneering work on geometric control for quadrotors, minimum-snap trajectory generation, and aggressive maneuvers through narrow gaps [3].
-- **MPPI for Robotic Control.** Williams et al. introduced Model Predictive Path Integral control as a sampling-based alternative to gradient-based MPC, enabling real-time optimization over nonlinear dynamics without requiring differentiability [4].
-- **Vision-Based Agile Flight.** Loquercio et al. demonstrated that learned perception combined with classical control can achieve robust agile flight in unstructured environments [5].
+Three systems stand out as the most thoroughly documented, competition-validated autonomous racing architectures. Each demonstrates a distinct design philosophy, and collectively they define the current state of the art.
 
-### 2.2 Common Architectural Pattern
+**AlphaPilot** [1] is the canonical competition-deployed system from the DARPA-sponsored AlphaPilot challenge (2019--2021). Its architecture combines a learned gate detector (corner confidence maps plus Part Affinity Fields for multi-gate association), an EKF-based sensor fusion pipeline that uses gate detections to correct VIO drift, and a time-optimal planner operating at 50 Hz. AlphaPilot provides concrete embedded timing data: gate detection inference runs in 10.5 ms on a Jetson Xavier with TensorRT FP16 (3.86 GFLOPS), VIO operates at approximately 35 Hz, and the system reports approximately 130 ms of end-to-end latency compensated by forward state prediction using IMU measurements [1, 10, 11].
 
-High-performing autonomous racing systems converge on a common pipeline:
+**Swift** [12] achieved champion-level performance against human pilots (Nature, 2023), representing the strongest demonstration of deep reinforcement learning in physical drone racing. Swift's design is explicitly modular: a corner-segmentation network produces gate poses from grayscale imagery (40 ms inference on Jetson TX2 with TensorRT FP16 at 384x384 resolution), a Kalman filter estimates translational VIO drift using gate observations, and a lightweight feedforward policy maps the resulting low-dimensional state to body rates and collective thrust (8 ms policy inference on CPU). The key to Swift's sim-to-real transfer is its use of empirical noise models estimated from real flight data to bridge sensing and dynamics discrepancies during simulation training [12, 13].
+
+**MonoRace** [14] won the April 2025 A2RL x DCL competition using a single rolling-shutter camera and IMU---the most sensor-constrained configuration among top systems. MonoRace combines neural gate segmentation with a drone dynamics model for state estimation, adds an offline calibration refinement procedure exploiting known gate geometry, and runs a tiny guidance-and-control network at 500 Hz on the flight controller. The system reports peak speeds of 28.23 m/s (approximately 100 km/h) and emphasizes robustness to real competition failures including camera interference and IMU saturation [14, 15].
+
+The convergent pattern across all three systems is:
 
 $$
-\text{Perception} \;\rightarrow\; \text{State Estimation} \;\rightarrow\; \text{Short-Horizon Optimal Control} \;\rightarrow\; \text{Geometric Tracking}
+\text{Task-Specific Perception Abstraction} \;\rightarrow\; \text{Gate-Corrected State Estimation} \;\rightarrow\; \text{Short-Horizon Optimal Control} \;\rightarrow\; \text{Low-Level Tracking}
 $$
 
-Learning is typically employed for specific subproblems---perception, value function approximation, planner distillation, or residual corrections---rather than as a monolithic end-to-end policy. Pure end-to-end reinforcement learning from pixels has not yet demonstrated competitive performance in real-world or high-fidelity racing scenarios, due to sample complexity, sim-to-real gaps, and lack of constraint awareness.
+Learning is employed for perception abstractions and (optionally) control policies, but never as a monolithic pixel-to-motor mapping. This pattern directly motivates our architecture.
 
-### 2.3 Positioning Our Approach
+### 2.2 Perception and State Estimation
 
-We adopt and extend this established pattern. Our baseline uses sampling-based optimal control (MPPI) with a carefully designed multi-objective cost function. We then propose a progression of learning-based enhancements---distillation, specialization, and residual RL---that preserve the interpretability and constraint-awareness of the classical core while improving speed, adaptability, and robustness.
+#### Gate Detection Approaches
+
+The literature presents a spectrum of gate detection methods, trading off compute cost against robustness to appearance variation:
+
+| Approach | Compute | Robustness | Representative System |
+|----------|---------|------------|----------------------|
+| Classical (HSV + contour + PnP) | CPU-only, 20+ Hz on low-power hardware | Fragile under lighting/texture variation | Snake gate detection [16] |
+| Tiny CNN bbox/corners + PnP | Small GPU; fits Jetson-class | Moderate; benefits from domain randomization | Deep Drone Racing [2] |
+| Corner maps + PAF association | 10.5 ms on Xavier (TensorRT FP16) | Excellent; handles multi-gate ambiguity | AlphaPilot [1, 11] |
+| U-Net corner segmentation | 40 ms on TX2 (TensorRT FP16) | Excellent; race-grade with drift correction | Swift [12, 13] |
+
+The dominant lesson is that race-winning systems do not attempt general-purpose vision; they extract a task-specific, low-dimensional representation (gate corners, gate pose) that is stable, cheap, and integrates cleanly into a filter and planner [1, 12, 16]. Kaufmann et al. [2] demonstrate an influential intermediate approach where a CNN maps raw images to a robust waypoint and desired speed, while a traditional planner generates minimum-jerk trajectory segments---"learn the abstraction, not the whole controller."
+
+#### State Estimation and Sensor Fusion
+
+A recurring theme is that VIO drifts substantially under high-speed flight due to motion blur and aggressive maneuvers, so gates serve as landmarks to correct drift rather than expecting VIO to remain globally accurate [1, 12, 17].
+
+Three VIO backbones appear most frequently in the racing literature: **ROVIO** (direct EKF-based, robust to feature-poor environments) [18], **VINS-Mono** (tightly coupled optimization-based, with robust initialization and failure recovery) [19], and **SVO** (semi-direct, designed for speed by operating on pixel intensities rather than extracted features) [20]. The design decision in a racing context is not which VIO is best in isolation, but what minimal ego-motion backbone is sufficient between gate updates, given that gate-derived corrections will stabilize drift.
+
+**Latency compensation** is critical. AlphaPilot explicitly reports that its 130 ms system latency must be compensated by predicting the state estimate forward using IMU measurements to maintain high control bandwidth [10]. Swift addresses a similar problem through its drift-state Kalman filter that estimates and subtracts translational drift velocity from VIO estimates [12, 13]. A recent A2RL x DCL competition system further introduces perception-aware planning that balances speed with keeping gates visible---a practical reminder that perception and planning cannot be separated naively when gates must remain in the field of view for reliable detection [15].
+
+### 2.3 Planning and Control Algorithms
+
+The planning and control problem in drone racing---minimum time subject to gate traversal, actuation limits, and dynamic feasibility---has been addressed by several algorithm families.
+
+**Minimum-snap trajectory generation** [3] remains a strong baseline. It is computationally lightweight (closed-form solves), produces smooth trajectories, and pairs well with geometric tracking controllers [6]. However, strict minimum-time traversal with constraints typically requires online time allocation or contouring objectives, so minimum-snap serves best as a fallback controller, trajectory initializer, or data generator for learning [21, 22].
+
+**Model Predictive Contouring Control (MPCC)** [21] reframes racing as progress maximization along a reference path while minimizing contouring error, allowing the optimizer to decide timing implicitly. **MPCC++** [22] extends this with safety constraints (track boundary enforcement, terminal invariant sets), learned residual dynamics to compensate model mismatch, and automated hyperparameter tuning via TuRBO. MPCC++ reports high speed and completion reliability but requires significant solver engineering and careful handling of the mapping from MPC outputs to low-level thrust and body-rate commands.
+
+**Model Predictive Path Integral control (MPPI)** [4] is a sampling-based alternative that handles nonconvex cost surfaces without requiring differentiability or convexity. For embedded feasibility, MPPI can exploit GPU parallelism: a Jetson Orin Nano study demonstrates GPU-parallelized MPPI meeting a 20 ms / 50 Hz constraint in trajectory tracking, while CPU-only MPPI fails the same deadline [23]. Huang et al. [9] recently demonstrated that a reference-free MPPI formulation with a gate-progress objective---closely matching our proposed cost function---achieves competitive or superior racing performance compared to trajectory-tracking baselines.
+
+**CEM and iCEM** [24] are additional sampling-based planners. Modern variants introduce temporal correlation and memory to reduce sample count, and hybrid approaches interleave CEM with gradient descent to improve convergence [25].
+
+**Learned policies** offer the lowest inference latency. Swift's feedforward policy runs in 8 ms [12]; MonoRace's guidance network runs at 500 Hz [14]. These are typically trained via teacher--student distillation or reinforcement learning, and represent the natural endpoint of our proposed improvement pipeline (Section 5).
+
+### 2.4 Robustness and Sim-to-Real Transfer
+
+Robustness in fast drone racing is not a single technique but an engineering posture: train across plausible variations, explicitly model residual mismatches, search aggressively for failures, and build fallbacks.
+
+**Domain randomization** is the most widely used sim-to-real transfer technique, with classic origins in visual randomization (Tobin et al.) and dynamics randomization (Peng et al.) [26]. In racing, the practical randomization variables that matter most include camera exposure/blur, rolling-shutter effects, texture and lighting (perception gap), and thrust curves, drag coefficients, motor lag, battery sag, and IMU bias/noise (dynamics and sensing gap) [12, 14, 26].
+
+**Residual dynamics models** provide an alternative to brute-force randomization. Swift attributes its successful sim-to-real transfer to empirical noise models estimated from real data [12, 13]. MPCC++ uses a complementary approach: augmenting nominal dynamics with learned residual terms while simultaneously enforcing safety constraints, addressing model mismatch while preserving constraint satisfaction structure [22].
+
+**Robust MPC** formalizes uncertainty handling. Tube-based MPC wraps a nominal plan with an ancillary feedback controller that keeps the actual state within a disturbance-invariant tube [27]. For racing, the most valuable robust MPC contribution is bounded-uncertainty guardrails: robust gate-crossing feasibility under pose errors, robust satisfaction of actuator limits under thrust scaling uncertainty, and robustness to latency jitter through forward prediction and constraint margins.
+
+**Adaptive Stress Testing (AST)** [28] provides a systematic approach to discovering rare but decisive failure modes. An RL agent chooses environment disturbances to reach failure states along likely trajectories, producing actionable counterexamples for system hardening. In racing, AST can uncover perception-dropout timing patterns that cause missed gates, rare IMU bias spikes that destabilize filters, and dynamics-lag combinations that cause saturation-induced gate clipping.
+
+### 2.5 Embedded Execution Constraints
+
+Because the AI Grand Prix drone specifications are not yet public, it is prudent to anchor compute budgets on the widely used embedded platforms in the racing literature:
+
+| Platform | Power Envelope | Compute | Used By |
+|----------|---------------|---------|---------|
+| Jetson TX2 | 7.5--15 W | 256 CUDA cores | Swift [12] |
+| Jetson Xavier | 10--30 W | 512 CUDA cores, 2x DLA | AlphaPilot [1] |
+| Jetson Orin Nano | 7--25 W | Up to 67 INT8 TOPS | MPPI feasibility studies [23] |
+
+The two most important software acceleration tools are **TensorRT** (used by both AlphaPilot and Swift for FP16/INT8 inference optimization) and **JIT compilation** (JAX XLA or Numba) for numerical kernels such as MPPI rollouts and CEM sampling. A practical rule consistent with the literature: run perception networks through TensorRT at FP16 minimum, keep the control inner loop deterministic and small, and push heavy sampling and rollout computation into compiled kernels [11, 13, 23].
+
+### 2.6 Positioning Our Approach
+
+We adopt and extend the convergent architectural pattern identified across AlphaPilot, Swift, and MonoRace. Our baseline uses sampling-based optimal control (MPPI) with a carefully designed multi-objective cost function that explicitly encodes the speed--safety tradeoff---an approach now independently validated by recent reference-free MPPI racing work [9]. We then propose a progression of learning-based enhancements---teacher--student distillation, MoE specialization, and residual RL---that preserve the interpretability and constraint-awareness of the classical core while improving inference speed, adaptability, and robustness. The key differentiator of our strategy is that each enhancement layer is designed to be **independently valuable and incrementally deployable**, allowing us to compete effectively in virtual qualifiers with the MPPI baseline while developing the learned components for physical-stage performance.
 
 ---
 
@@ -621,3 +695,41 @@ This architecture reflects the state of the art in autonomous racing: not massiv
 [8] Shao, J., Jiang, Y., & Scaramuzza, D. (2023). Mixture-of-experts for agile quadrotor control. *arXiv preprint*.
 
 [9] Huang, Y., et al. (2025). Rethinking reference trajectories in agile drone racing: A unified reference-free model-based controller via MPPI. *arXiv preprint arXiv:2509.14726*.
+
+[10] Foehn, P., et al. (2020). AlphaPilot: Autonomous drone racing -- supplementary: latency analysis and state prediction. *RSS 2020 Workshop*.
+
+[11] Guerra, W., et al. (2019). FlightGoggles: Photorealistic sensor simulation for perception-driven robotics using photogrammetry and virtual reality. *Proceedings of the IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)*.
+
+[12] Kaufmann, E., Bauersfeld, L., Loquercio, A., Müller, M., Koltun, V., & Scaramuzza, D. (2023). Champion-level drone racing using deep reinforcement learning. *Nature*, 620, 982--987.
+
+[13] Kaufmann, E., et al. (2023). Champion-level drone racing using deep reinforcement learning -- supplementary materials. *Nature*, 620.
+
+[14] Bosello, M., et al. (2026). MonoRace: Monocular autonomous drone racing with robust perception and agile control. *arXiv preprint*.
+
+[15] Trumpp, R., et al. (2025). Perception-aware model predictive control for autonomous drone racing. *A2RL x DCL Competition Report*.
+
+[16] De Wagter, C., et al. (2018). Autonomous flight of a 20-gram flapping wing MAV with a 4-gram onboard stereo vision system. *Proceedings of the IEEE International Conference on Robotics and Automation (ICRA)*.
+
+[17] Hanover, D., et al. (2024). Autonomous drone racing: A survey. *IEEE Transactions on Robotics*.
+
+[18] Bloesch, M., Omari, S., Hutter, M., & Siegwart, R. (2015). Robust visual inertial odometry using a direct EKF-based approach. *Proceedings of the IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)*, 298--304.
+
+[19] Qin, T., Li, P., & Shen, S. (2018). VINS-Mono: A robust and versatile monocular visual-inertial state estimator. *IEEE Transactions on Robotics*, 34(4), 1004--1020.
+
+[20] Forster, C., Pizzoli, M., & Scaramuzza, D. (2014). SVO: Fast semi-direct monocular visual odometry. *Proceedings of the IEEE International Conference on Robotics and Automation (ICRA)*, 15--22.
+
+[21] Romero, A., Sun, S., Foehn, P., & Scaramuzza, D. (2022). Model predictive contouring control for time-optimal quadrotor flight. *IEEE Transactions on Robotics*, 38(6), 3340--3356.
+
+[22] Romero, A., et al. (2024). MPCC++: Model predictive contouring control with safety constraints, residual dynamics, and automated tuning. *arXiv preprint*.
+
+[23] Enrico, R., et al. (2024). Comparison of NMPC and GPU-parallelized MPPI for UAV control on embedded hardware. *Applied Sciences*, 15, 9114.
+
+[24] Pinneri, C., et al. (2021). Sample-efficient cross-entropy method for real-time planning. *Proceedings of the Conference on Robot Learning (CoRL)*.
+
+[25] Bhardwaj, M., et al. (2022). STORM: An integrated framework for fast joint-space model-predictive control for reactive manipulation. *Proceedings of the Conference on Robot Learning (CoRL)*.
+
+[26] Tobin, J., et al. (2017). Domain randomization for transferring deep neural networks from simulation to the real world. *Proceedings of the IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)*.
+
+[27] Mayne, D. Q. (2005). Robust model predictive control of constrained linear systems with bounded disturbances. *Automatica*, 41(2), 219--224.
+
+[28] Koren, M., Alsaif, S., Lee, R., & Kochenderfer, M. J. (2018). Adaptive stress testing for autonomous vehicles. *Proceedings of the IEEE Intelligent Vehicles Symposium (IV)*, 1--7.
